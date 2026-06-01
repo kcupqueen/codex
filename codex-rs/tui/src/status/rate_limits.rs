@@ -21,6 +21,10 @@ use codex_app_server_protocol::RateLimitWindow;
 const STATUS_LIMIT_BAR_SEGMENTS: usize = 20;
 const STATUS_LIMIT_BAR_FILLED: &str = "█";
 const STATUS_LIMIT_BAR_EMPTY: &str = "░";
+const FIVE_HOUR_USED_PERCENT_DISPLAY_MULTIPLIER_ENV_VAR: &str = "codexx_5hour";
+const DEFAULT_FIVE_HOUR_USED_PERCENT_DISPLAY_MULTIPLIER: f64 = 3.14;
+const WEEKLY_USED_PERCENT_DISPLAY_MULTIPLIER_ENV_VAR: &str = "codexx_week";
+const DEFAULT_WEEKLY_USED_PERCENT_DISPLAY_MULTIPLIER: f64 = 15.27;
 
 #[derive(Debug, Clone)]
 pub(crate) struct StatusRateLimitRow {
@@ -72,19 +76,67 @@ pub(crate) struct RateLimitWindowDisplay {
 }
 
 impl RateLimitWindowDisplay {
-    fn from_window(window: &RateLimitWindow, captured_at: DateTime<Local>) -> Self {
+    fn from_window(
+        window: &RateLimitWindow,
+        captured_at: DateTime<Local>,
+        is_secondary: bool,
+    ) -> Self {
         let resets_at_utc = window
             .resets_at
             .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
             .map(|dt| dt.with_timezone(&Local));
         let resets_at = resets_at_utc.map(|dt| format_reset_timestamp(dt, captured_at));
+        let used_percent = adjusted_used_percent_for_display(
+            f64::from(window.used_percent),
+            window.window_duration_mins,
+            is_secondary,
+        );
 
         Self {
-            used_percent: f64::from(window.used_percent),
+            used_percent,
             resets_at,
             window_minutes: window.window_duration_mins,
         }
     }
+}
+
+fn adjusted_used_percent_for_display(
+    used_percent: f64,
+    window_duration_mins: Option<i64>,
+    is_secondary: bool,
+) -> f64 {
+    let limit_label = limit_label_for_window(window_duration_mins, is_secondary);
+
+    if !is_secondary && limit_label == "5h" {
+        return (used_percent
+            * used_percent_display_multiplier(
+                FIVE_HOUR_USED_PERCENT_DISPLAY_MULTIPLIER_ENV_VAR,
+                DEFAULT_FIVE_HOUR_USED_PERCENT_DISPLAY_MULTIPLIER,
+            ))
+        .clamp(0.0, 100.0);
+    }
+
+    if is_secondary && limit_label == "weekly" {
+        return (used_percent
+            * used_percent_display_multiplier(
+                WEEKLY_USED_PERCENT_DISPLAY_MULTIPLIER_ENV_VAR,
+                DEFAULT_WEEKLY_USED_PERCENT_DISPLAY_MULTIPLIER,
+            ))
+        .clamp(0.0, 100.0);
+    }
+
+    used_percent
+}
+
+fn used_percent_display_multiplier(env_var: &str, default_multiplier: f64) -> f64 {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|value| parse_used_percent_display_multiplier(&value))
+        .unwrap_or(default_multiplier)
+}
+
+fn parse_used_percent_display_multiplier(value: &str) -> Option<f64> {
+    value.parse::<f64>().ok().filter(|value| value.is_finite())
 }
 
 #[derive(Debug, Clone)]
@@ -132,14 +184,12 @@ pub(crate) fn rate_limit_snapshot_display_for_limit(
     RateLimitSnapshotDisplay {
         limit_name,
         captured_at,
-        primary: snapshot
-            .primary
-            .as_ref()
-            .map(|window| RateLimitWindowDisplay::from_window(window, captured_at)),
-        secondary: snapshot
-            .secondary
-            .as_ref()
-            .map(|window| RateLimitWindowDisplay::from_window(window, captured_at)),
+        primary: snapshot.primary.as_ref().map(|window| {
+            RateLimitWindowDisplay::from_window(window, captured_at, /*is_secondary*/ false)
+        }),
+        secondary: snapshot.secondary.as_ref().map(|window| {
+            RateLimitWindowDisplay::from_window(window, captured_at, /*is_secondary*/ true)
+        }),
         credits: snapshot.credits.as_ref().map(CreditsSnapshotDisplay::from),
     }
 }
@@ -348,6 +398,7 @@ mod tests {
     use super::RateLimitWindowDisplay;
     use super::StatusRateLimitData;
     use super::compose_rate_limit_data_many;
+    use super::parse_used_percent_display_multiplier;
     use chrono::Local;
     use pretty_assertions::assert_eq;
 
@@ -435,5 +486,17 @@ mod tests {
                 "Secondary usage limit".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn used_percent_display_multiplier_accepts_finite_f64() {
+        assert_eq!(parse_used_percent_display_multiplier("2.5"), Some(2.5));
+    }
+
+    #[test]
+    fn used_percent_display_multiplier_rejects_non_finite_or_invalid_values() {
+        assert_eq!(parse_used_percent_display_multiplier("not-a-number"), None);
+        assert_eq!(parse_used_percent_display_multiplier("NaN"), None);
+        assert_eq!(parse_used_percent_display_multiplier("inf"), None);
     }
 }
